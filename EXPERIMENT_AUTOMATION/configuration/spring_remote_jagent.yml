@@ -1,0 +1,10 @@
+# `eBPF active`: the JVM runs with the USDT probes enabled and the eBPF jAgent
+# attaches to it on the SUT after warm-up. Per-transaction records go to the
+# jagent-trace artifact; libbpf and OTLP diagnostics go to the jagent log.
+extends: base.yml
+
+experiment:
+  type: spring_remote_jagent
+
+sut:
+  agent: jagent   # implies the DTrace probe flags

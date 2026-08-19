@@ -1,0 +1,17 @@
+# `USDT + empty eBPF`: the control between `USDT only` and `eBPF active`.
+#
+# The same three HotSpot USDT probes are attached, but the eBPF programs do
+# nothing. The gap to `usdt` is the cost of the probes actually *firing* --
+# attaching any consumer turns the JVM's nop-patched probe sites into traps, so
+# every Java method entry and return becomes a user->kernel transition. The gap
+# from here to `jagent` is the cost of the agent's own bookkeeping.
+extends: base.yml
+
+experiment:
+  type: spring_remote_noop
+
+sut:
+  agent: jagent   # implies the DTrace probe flags and the attach step
+
+jagent:
+  provision: noop

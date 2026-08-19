@@ -1,0 +1,5 @@
+======================================================================
+ Campaign finished: 72/72 runs succeeded
+ Started 22:21:34,67 -- ended  7:39:12,30
+ Results: C:\Users\Admin\IdeaProjects\tracing-transaction-level-resource-consumption-with-ebpf-and-opentelemetry\EXPERIMENT_AUTOMATION\output\
+======================================================================

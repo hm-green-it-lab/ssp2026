@@ -1,0 +1,320 @@
+# Shared settings for every experiment.
+#
+# Three machines: this controller runs the automation, ${JMETER_HOST} runs
+# JMeter, ${SUT_HOST} runs the application plus the instrumentation under test.
+# Variant configs override `experiment.type` and the `sut.agent` /
+# `sut.usdt_probes` pair; everything else is inherited from here.
+
+experiment:
+  iterations: 3
+  wait_between_runs: 30
+  local_output_directory: ./output
+
+  # Seconds to wait for the service to accept connections after launch.
+  sut_ready_timeout: 180
+
+  # Requests fired on the SUT before the tracer attaches and before load
+  # starts, so JIT compilation has settled. The paper reports only post-warm-up
+  # transactions.
+  warmup_requests: 100
+  warmup_path: /test-rest-endpoint/getData
+
+  # Delete the per-run remote directories once artifacts are downloaded.
+  cleanup_remote: true
+
+# =============================
+# System under test  (machine 3)
+# =============================
+sut:
+  target_host: ${SUT_HOST}
+  remote_dir: ${SUT_BASE_DIR}/work
+
+  # Paths below are interpreted ON THE SUT.
+  jar_path: ${SPRING_REST_SERVICE_JAR}
+  java_bin: ${JAVA_BIN}
+  port: 8081
+  jvm_args: "-Xms1g -Xmx1g"
+
+  # none | otjae | jagent  (overridden per variant)
+  agent: none
+  # Adds -XX:+DTraceAllocProbes -XX:+DTraceMethodProbes. Implied by agent: jagent.
+  usdt_probes: false
+
+  stop_timeout: 30
+
+# =============================
+# OTJAE (OpenTelemetry Java agent + RETIT extension)
+# =============================
+# Both JARs are staged from the controller to the SUT, so all runs use the same
+# build. Leave the local_* keys empty to download them into artifacts/.
+otjae:
+  local_otel_agent_jar:
+  otel_agent_url: https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/latest/download/opentelemetry-javaagent.jar
+
+  local_extension_jar:
+  extension_url: https://github.com/RETIT/opentelemetry-javaagent-extension/releases/download/v0.1.1-beta/io.retit.opentelemetry.javaagent.extension.jar
+
+  service_name: spring-app
+
+  properties:
+    # The exporter and endpoint are overwritten at run time to point at the
+    # controller-side collector, so OTJAE and the jAgent share one export path
+    # and stay comparable. Set collector.enabled: false to keep these values.
+    otel.traces.exporter: otlp
+    otel.metrics.exporter: otlp
+    otel.logs.exporter: otlp
+    otel.metric.export.interval: 10000
+
+    # Required by the RETIT extension to resolve its emission factors.
+    io.retit.emissions.cloud.provider: aws
+    io.retit.emissions.cloud.provider.region: af-south-1
+    io.retit.emissions.cloud.provider.instance.type: a1.medium
+
+# =============================
+# eBPF jAgent  (runs on the SUT: it needs that kernel and that JVM's PID)
+# =============================
+jagent:
+  # release      download the published linux-x86_64 build (no toolchain needed
+  #              on the SUT; reproducible against a fixed tag)
+  # noop         build the empty control agent from ./noop_agent (same probes,
+  #              empty handlers) to separate probe-firing cost from agent work
+  # source       ship this controller's working tree and `make` it on the SUT
+  #              (use to measure uncommitted changes)
+  # preinstalled assume a binary is already at jagent.binary
+  #
+  # `release` is the reproducible mode and the one to cite: it pins the measured
+  # build to a tag, whereas `source` measures whatever happens to be in
+  # source_dir. v0.0.2-alpha is the first release carrying --probes.
+  provision: release
+
+  # Where the release or source tree lands ON THE SUT.
+  install_dir: ${JAGENT_REMOTE_DIR}
+
+  # --- provision: release ---
+  # The archive unpacks into a version-stamped directory and the binary is
+  # located inside it, so a version bump needs only this URL changed. The BPF
+  # object is embedded in the binary; the .bpf.o in the archive is for
+  # inspection only.
+  release_url: https://github.com/hm-green-it-lab/ebpf-jagent/releases/download/v0.0.7-alpha/ebpf-jagent-v0.0.7-alpha-linux-x86_64.tar.gz
+  # Set to reuse an archive already on the controller instead of downloading.
+  local_release_archive:
+
+  # --- provision: source ---
+  # The agent cannot be cross-built: its userspace part links libbpf/libelf/
+  # libcurl and the BPF object needs the SUT's kernel headers.
+  source_dir: ${JAGENT_LOCAL_DIR}
+  # `make` does not need root here, and root-owned products complicate a later
+  # sync, so this is opt-in.
+  build_with_sudo: false
+
+  # --- provision: noop ---
+  # Defaults to ./noop_agent next to this automation.
+  noop_source_dir:
+
+  # --- provision: preinstalled ---
+  binary:
+
+  # Overlay install_dir (default) or wipe it first.
+  sync_clean: false
+
+  # Substring matched against class and method name inside the kernel.
+  #
+  # It must match at most one frame per stack. The agent emits an event for
+  # every matching return and rolls each one's resources into its caller, so a
+  # filter matching a method nested inside another match -- a class name such as
+  # `TestService`, which also covers naiveSortingWithONSquareComplexity and
+  # generateRandomInputArray -- would emit records that contain one another and
+  # double-count when summed.
+  filter: veryComplexBusinessFunction
+
+  # Suppress emission of calls shorter than this, in microseconds.
+  #
+  # The measured method runs ~180 ms, three orders of magnitude above this
+  # threshold, while the JDK calls nested inside it (charAt, checkIndex, and
+  # thousands more per request) are sub-microsecond. Only the latter are
+  # suppressed, and only from *emission*: the gate sits after the parent
+  # propagation in method_return, so their resources still roll up into the
+  # transaction and the totals are unchanged.
+  #
+  # What it saves is the expensive tail of the return handler -- four USDT
+  # argument reads, two copies out of user memory and the substring match --
+  # which with the default of 0 runs for every nested call. This is the knob for
+  # keeping deep frames cheap; the kernel-side MAX_TRACE_DEPTH cap cannot do it,
+  # because the hot frames are the ones *below* the measured method and any cap
+  # that admits the method admits them too.
+  #
+  # Needs an agent supporting --min-duration-us (v0.0.4-alpha or later). Leave
+  # empty to emit everything.
+  #
+  # This setting only does its job on a build whose MAX_TRACE_DEPTH is above the
+  # depth of the filtered method. v0.0.4-alpha capped at 32, which sits *above*
+  # veryComplexBusinessFunction in a Tomcat/Spring stack, so both probes
+  # returned early and the agent emitted nothing at all while looking 38%
+  # faster than the no-op control. Raised to 128 in v0.0.5-alpha; do not pin
+  # this config back to an earlier release without re-checking that
+  # per-transaction records still appear.
+  min_duration_us: 1000
+
+  # Resource dimensions to collect: cpu, memory, network, storage, or all.
+  #
+  # Restricted to cpu+memory to match OTJAE, which collects only those unless
+  # its other dimensions are explicitly enabled. This is not just about which
+  # numbers get reported: the network and storage probes hook kernel-wide
+  # functions (sock_sendmsg, sock_recvmsg, sys_enter_write), so leaving them
+  # attached makes every socket operation and every write() on the whole
+  # machine trap -- a cost OTJAE never pays, which would show up as
+  # instrumentation overhead that is really an artefact of collecting
+  # dimensions the comparison does not use.
+  #
+  # `cpu` is always collected regardless: it comes from the same
+  # method__entry/method__return probes that delimit a transaction.
+  #
+  # Needs an agent supporting --probes (v0.0.2-alpha or later). Leave empty to
+  # collect everything.
+  probes: cpu, memory
+
+  # Must be the libjvm.so belonging to sut.java_bin.
+  jvm_lib_path: ${JVM_LIB_PATH}
+
+  # Mandatory even without a collector listening: the agent exits if unset.
+  otlp_endpoint: http://127.0.0.1:4318/v1/metrics
+
+  # The agent writes one formatted line per transaction to its output file.
+  # That is redundant -- its OTLP metrics already emit one datapoint per
+  # transaction, so differencing the cumulative series reproduces the same
+  # values -- and it costs formatting plus file I/O on the hot path, which the
+  # OTJAE comparison does not pay. Off by default; set true to keep the file.
+  write_trace: false
+
+  attach_settle_secs: 5
+  stop_timeout: 30
+
+# =============================
+# OpenTelemetry Collector  (on the CONTROLLER)
+# =============================
+# Both tools export OTLP, so the collector is the common point that keeps the
+# comparison fair. It runs on the controller rather than beside the application:
+# a collector on the SUT would compete for the very CPU cycles being measured,
+# and would perturb the `eBPF active` configuration hardest.
+collector:
+  enabled: true
+
+  # container | binary
+  mode: container
+  container_runtime: auto   # auto | docker | podman
+  # The file and prometheus exporters are contrib-only; the core image will not do.
+  image: otel/opentelemetry-collector-contrib:latest
+  # For mode: binary -- path to an otelcol-contrib executable on the controller.
+  binary:
+
+  # Address the SUT should export to. Auto-detected from the route toward the
+  # SUT when empty; set it if the controller is multi-homed or behind NAT.
+  controller_host:
+
+  # How the SUT reaches the collector.
+  #   auto    try the controller's LAN address, fall back to a reverse SSH
+  #           forward (needed when the runtime publishes only to the WSL VM's
+  #           loopback, as podman/Docker Desktop on Windows do, or when a
+  #           firewall blocks the direct path)
+  #   always  always tunnel
+  #   never   require the direct path and fail if it is not reachable
+  tunnel: auto
+
+  otlp_http_port: 4318
+  otlp_grpc_port: 4317
+  prometheus_port: 8889
+  batch_timeout: 5s
+
+# =============================
+# http-logger  (on the CONTROLLER)
+# =============================
+# Samples the collector's Prometheus endpoint, as in the ASE experiment. Both
+# tools emit cumulative sums, so a sampled series is what lets the steady-state
+# window be separated from ramp-up and ramp-down; the collector's file exporter
+# additionally records every point losslessly.
+http_logger:
+  enabled: false
+  local_jar:
+  jar_url: https://github.com/hm-green-it-lab/http-logger/releases/download/v0.0.1/http-logger-1.0-runner.jar
+  java_bin: java
+  # Quartz cron; every 5 seconds.
+  cron: "*/5 * * * * ?"
+  # Defaults to the collector's Prometheus endpoint when empty.
+  urls: []
+
+# =============================
+# JMeter
+# =============================
+jmeter:
+  enabled: true
+
+  # controller  run JMeter on this machine; results land straight in output/
+  # remote      run it on a dedicated load driver over SSH
+  # Either way the generator is a different machine from the SUT, so it does not
+  # compete with the traced JVM for CPU.
+  location: controller
+
+  # Interpreted on whichever host runs JMeter.
+  # On a Windows controller this is usually .../bin/jmeter.bat
+  bin_path: ${JMETER_BIN}
+  java_home: ${JMETER_JAVA_HOME}
+
+  # --- location: remote only ---
+  target_host: ${JMETER_HOST}
+  remote_dir: ${JMETER_BASE_DIR}/output
+
+  # Resolved on the controller; uploaded only in remote mode.
+  #
+  # GET-only variant of the RETIT plan: the stock plan issues GET, POST and
+  # DELETE per arrival, but the jAgent's method filter only matches the GET
+  # path, so the two tools would otherwise observe different populations --
+  # 27,100 OTJAE spans against 2,435 jAgent records in the first campaign.
+  # Note each arrival now issues 1 request instead of 3.
+  # Leave empty to download the stock plan into artifacts/ instead.
+  local_test_plan: ./jmeter/jmeter_testplan_get_only.jmx
+  test_plan_url: https://raw.githubusercontent.com/RETIT/opentelemetry-javaagent-extension/main/examples/spring-rest-service/src/test/resources/jmeter_testplan.jmx
+
+  heap_xms: 2g
+  heap_xmx: 2g
+  extra_jvm_args: ""
+
+  # Seconds allowed for JMeter to boot its JVM and parse the plan before the
+  # schedule actually starts. This is NOT part of the 240s duration; measured at
+  # ~26s on a Windows controller, so 90 leaves headroom.
+  startup_allowance_secs: 90
+
+  # Extra seconds after the schedule ends, for the summariser to flush.
+  summary_wait_secs: 60
+
+  props:
+    # The load driver must reach the SUT under this address.
+    hostname: ${SUT_HOST}
+    port: 8081
+
+    total_rate: 10
+
+    # 60s ramp-up + 120s steady state + 60s ramp-down = 240s (4 minutes).
+    ramp_up_and_down: 60
+    steady_state: 120
+
+    summariser.name: summary
+    summariser.interval: 10
+    summariser.log: true
+    summariser.out: true
+
+    jmeter.save.saveservice.output_format: csv
+    jmeter.save.saveservice.assertion_results: none
+    jmeter.save.saveservice.response_data: false
+    jmeter.save.saveservice.response_headers: false
+    jmeter.save.saveservice.request_headers: false
+    jmeter.save.saveservice.samplerData: false
+    jmeter.save.saveservice.response_data.on_error: false
+    jmeter.save.saveservice.url: false
+    jmeter.save.saveservice.latency: true
+    jmeter.save.saveservice.connect_time: true
+    jmeter.save.saveservice.bytes: true
+    jmeter.save.saveservice.sent_bytes: true
+    jmeter.save.saveservice.label: true
+    jmeter.save.saveservice.success: true
+    jmeter.save.saveservice.response_code: true
+    jmeter.save.saveservice.time: true

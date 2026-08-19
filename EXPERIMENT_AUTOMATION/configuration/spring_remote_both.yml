@@ -1,0 +1,54 @@
+# `both agents at once`: the negative control for the CPU comparison.
+#
+# Not a step in the overhead ladder. The two agents perturb each other, so
+# neither the response times nor the demands from this run are comparable with
+# the other variants, and it must stay OUT of the randomised campaign -- adding
+# a sixth treatment would change the Latin square and pollute the paired
+# statistics with a configuration that is not a treatment.
+#
+# WHAT IT TESTS
+#
+# Both tools read the same kernel field for CPU. The jAgent computes
+# `se.sum_exec_runtime` plus the current slice inside BPF; OTJAE's
+# `io.retit.startcputime`/`endcputime` come from
+# ThreadMXBean.getCurrentThreadCpuTime(), which on Linux is
+# CLOCK_THREAD_CPUTIME_ID -> task_sched_runtime() -> the same field. The eBPF
+# probes fire on the measured thread, so their cost is inside *both* readings
+# and cancels in any comparison taken within a single run.
+#
+# That is the suspected explanation for the original single-threaded result
+# (chapters/chap5.tex): CPU demands agreed to ~9% between the two agents while
+# the response time degraded by 202.8%. The agreement would be an artefact of
+# the measurement design, not evidence that the jAgent measures accurately.
+#
+# PREDICTION
+#
+# Run separately, the two tools disagree by ~7x (OTJAE 16.43 ms vs jAgent
+# 121.97 ms per transaction). Run together, the hypothesis says OTJAE's CPU
+# should jump to roughly the jAgent's value and the two should agree.
+#
+#   - both agree at ~120 ms  -> hypothesis confirmed; the original agreement is
+#                               explained and the 8.9% figure cannot support an
+#                               accuracy claim
+#   - OTJAE still reports ~16 ms -> hypothesis refuted; the divergence has
+#                               another cause and needs a different explanation
+#
+# Either outcome is publishable; the point is that it is a falsifiable test
+# rather than an assertion.
+#
+# NOTE ON BOUNDARIES
+#
+# Both agents observe TestService.veryComplexBusinessFunction: the jAgent via
+# its kernel-side filter, OTJAE via the @WithSpan annotation added by
+# setup/sut_setup.py. The windows are not identical -- OTJAE's span brackets the
+# method in bytecode, the jAgent's frame brackets the USDT probe pair -- but
+# both are far narrower than the difference under test.
+extends: base.yml
+
+experiment:
+  type: spring_remote_both
+
+sut:
+  # Puts the OTJAE javaagent on the JVM command line AND enables the DTrace
+  # probes, and makes the runner attach the eBPF jAgent after warm-up.
+  agent: both

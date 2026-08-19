@@ -1,0 +1,11 @@
+# `USDT only`: the JVM emits its DTrace method/allocation probes, but no eBPF
+# program is attached, so the probe sites stay nop-patched. Isolates the
+# JVM-side cost of the flags from the cost of tracing.
+extends: base.yml
+
+experiment:
+  type: spring_remote_usdt
+
+sut:
+  agent: none
+  usdt_probes: true

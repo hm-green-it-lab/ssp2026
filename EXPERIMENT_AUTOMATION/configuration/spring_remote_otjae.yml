@@ -1,0 +1,10 @@
+# In-process baseline: OpenTelemetry Java agent + RETIT extension. Resource
+# demands are written to the SUT log via the `logging` exporters.
+extends: base.yml
+
+experiment:
+  type: spring_remote_otjae
+
+sut:
+  agent: otjae
+  usdt_probes: false

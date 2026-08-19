@@ -1,0 +1,9 @@
+# Uninstrumented baseline: the `default` column of the overhead table.
+extends: base.yml
+
+experiment:
+  type: spring_remote_none
+
+sut:
+  agent: none
+  usdt_probes: false
