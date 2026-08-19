@@ -47,9 +47,17 @@ sut:
 # =============================
 # Both JARs are staged from the controller to the SUT, so all runs use the same
 # build. Leave the local_* keys empty to download them into artifacts/.
+#
+# Both URLs are pinned to a version rather than to `latest`. Staging one build
+# to every host keeps the machines consistent within a campaign, but says
+# nothing about consistency between campaigns: a `latest` URL resolves to
+# whatever happens to be current on the day, so a rerun months later would
+# silently measure a different agent and the difference would be invisible in
+# the results.
 otjae:
   local_otel_agent_jar:
-  otel_agent_url: https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/latest/download/opentelemetry-javaagent.jar
+  # v2.30.0 is the version the paper's campaign measured.
+  otel_agent_url: https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/download/v2.30.0/opentelemetry-javaagent.jar
 
   local_extension_jar:
   extension_url: https://github.com/RETIT/opentelemetry-javaagent-extension/releases/download/v0.1.1-beta/io.retit.opentelemetry.javaagent.extension.jar
@@ -203,7 +211,12 @@ collector:
   mode: container
   container_runtime: auto   # auto | docker | podman
   # The file and prometheus exporters are contrib-only; the core image will not do.
-  image: otel/opentelemetry-collector-contrib:latest
+  #
+  # Pinned rather than `latest`: the collector is the common export path for
+  # both tools and the file exporter's OTLP JSON is what the analysis parses, so
+  # an unannounced version bump could change the shape of the data of record.
+  # 0.158.0 is the version the paper's campaign ran.
+  image: otel/opentelemetry-collector-contrib:0.158.0
   # For mode: binary -- path to an otelcol-contrib executable on the controller.
   binary:
 
@@ -271,8 +284,12 @@ jmeter:
   # 27,100 OTJAE spans against 2,435 jAgent records in the first campaign.
   # Note each arrival now issues 1 request instead of 3.
   # Leave empty to download the stock plan into artifacts/ instead.
+  #
+  # The fallback URL is pinned to the same tag as the extension JAR rather than
+  # tracking `main`, so clearing local_test_plan yields the plan as it stood for
+  # that release instead of whatever main holds today.
   local_test_plan: ./jmeter/jmeter_testplan_get_only.jmx
-  test_plan_url: https://raw.githubusercontent.com/RETIT/opentelemetry-javaagent-extension/main/examples/spring-rest-service/src/test/resources/jmeter_testplan.jmx
+  test_plan_url: https://raw.githubusercontent.com/RETIT/opentelemetry-javaagent-extension/v0.1.1-beta/examples/spring-rest-service/src/test/resources/jmeter_testplan.jmx
 
   heap_xms: 2g
   heap_xmx: 2g

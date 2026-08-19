@@ -2,9 +2,15 @@
 
 Reruns the measurements behind the SSP paper.
 
+> **Only reading the paper's numbers?** You do not need any of this. The
+> measured data ships in [`../EXPERIMENT_RESULTS/`](../EXPERIMENT_RESULTS/README.md)
+> and needs two commands and no Linux host. This directory is for repeating the
+> measurement; see the [root README](../README.md) for how the pieces fit
+> together.
+
 | Role | Runs |
 |---|---|
-| **Controller** | this automation — credentials, artifact staging, result collection, **JMeter, the OpenTelemetry Collector and the http-logger** |
+| **Controller** | this automation — credentials, artifact staging, result collection, **JMeter, the OpenTelemetry Collector and (optionally) the http-logger** |
 | **SUT** (`${SUT_HOST}`) | `spring-rest-service` + the instrumentation under test |
 | **Load driver** (`${JMETER_HOST}`) | JMeter, *only* with `jmeter.location: remote` |
 
@@ -13,7 +19,7 @@ plain `java -jar` process rather than in a container.
 
 What matters methodologically is that the load generator is not on the SUT: the
 measured quantity is request latency, and a co-located generator would compete
-for the same CPUs as the traced JVM — hitting the `eBPF active` configuration
+for the same CPUs as the traced JVM — hitting the traced (`jagent`/`noop`) configurations
 hardest, which is exactly the number under scrutiny. Running JMeter on the
 controller satisfies this, since the controller is a separate machine. Use
 `jmeter.location: remote` if you want a third, dedicated driver.
@@ -23,16 +29,34 @@ ramp-down.
 
 ## Experiment variants
 
-| Config | JVM on the SUT | Tool | Paper column |
-|---|---|---|---|
-| `spring_remote_none.yml` | plain | — | `default` |
-| `spring_remote_usdt.yml` | `-XX:+DTrace*Probes` | — | `USDT only` |
-| `spring_remote_jagent.yml` | `-XX:+DTrace*Probes` | eBPF jAgent | `eBPF active` |
-| `spring_remote_otjae.yml` | plain | OTJAE | accuracy baseline |
+Four of the six form an **overhead ladder**, each step adding exactly one thing
+over the one before it, so every gap attributes to a single cause. `otjae` is
+the comparison baseline and `both` a control that is deliberately not a rung.
+
+| Config | JVM on the SUT | Attached | Isolates | Paper |
+|---|---|---|---|---|
+| `spring_remote_none.yml` | plain | — | the baseline | `none` |
+| `spring_remote_usdt.yml` | `-XX:+DTrace*Probes` | — | cost of the probe *flags* | `usdt` |
+| `spring_remote_noop.yml` | `-XX:+DTrace*Probes` | empty eBPF handlers | cost of the probes *firing* | `noop` |
+| `spring_remote_jagent.yml` | `-XX:+DTrace*Probes` | eBPF jAgent | cost of the agent's *work* | `jagent` |
+| `spring_remote_otjae.yml` | plain | OTJAE | the in-process baseline | `otjae` |
+| `spring_remote_both.yml` | `-XX:+DTrace*Probes` | jAgent **and** OTJAE | whether the tools' agreement is structural | `both` |
 
 `spring_remote_usdt` separates the JVM-side cost of the probe flags from the
 cost of tracing: the probes are emitted but nothing is attached, so their sites
-stay nop-patched.
+stay nop-patched. `spring_remote_noop` then attaches eBPF programs whose
+handlers do nothing, which turns those nop-patched sites into traps — the gap
+from `usdt` to `noop` is what the probes cost merely by firing, and the gap from
+`noop` to `jagent` is the agent's own bookkeeping. The `noop` agent is built
+from [`noop_agent/`](noop_agent/) via `jagent.provision: noop`.
+
+`spring_remote_both` is a **negative control, not a deployable configuration**:
+the two agents perturb each other, so its response times belong in no ladder. It
+runs inside the same campaign anyway, because it is compared against the
+`jagent` and `otjae` runs and a separate session would confound drift with the
+effect it exists to demonstrate. Its full rationale, including the falsifiable
+prediction it tests, is at the top of
+[`configuration/spring_remote_both.yml`](configuration/spring_remote_both.yml).
 
 ## Prerequisites
 
@@ -62,22 +86,50 @@ RETIT extension JAR and the JMeter test plan — is fetched by the controller in
 `artifacts/` and uploaded to the host that needs it, so all three machines stay
 on the same versions.
 
+Each of those is pinned to a version in `configuration/base.yml`, and to the
+version the paper's campaign measured:
+
+| Component | Pinned to | Key |
+|---|---|---|
+| eBPF jAgent | `v0.0.7-alpha` | `jagent.release_url` |
+| OpenTelemetry Java agent | `v2.30.0` | `otjae.otel_agent_url` |
+| RETIT extension (OTJAE) | `v0.1.1-beta` | `otjae.extension_url` |
+| OpenTelemetry Collector (contrib) | `0.158.0` | `collector.image` |
+| JMeter plan (stock, fallback only) | `v0.1.1-beta` | `jmeter.test_plan_url` |
+
+Staging one build to every host keeps the machines consistent *within* a
+campaign; pinning is what keeps them consistent *between* campaigns. A `latest`
+URL resolves to whatever is current on the day, so a rerun months from now would
+silently measure a different agent and nothing in the results would show it.
+Bump a version by editing the URL — the manifest of every run records what was
+actually used.
+
+The JDK, JMeter and the operating system come from the hosts, not from the
+configuration, so those stay yours to match; the versions the paper used are in
+the [root README](../README.md#environment-of-record).
+
 ### How the jAgent reaches the SUT
 
-`jagent.provision` selects one of three modes:
+`jagent.provision` selects one of four modes:
 
 | Mode | What happens | When to use it |
 |---|---|---|
 | `release` (default) | Download the published `linux-x86_64` tarball, ship it to the SUT, unpack, locate the binary | Ubuntu targets; reproducible against a fixed tag |
+| `noop` | Ship `noop_agent/` and `make` it on the SUT — the same probes with empty handlers | The `noop` control variant |
 | `source` | Ship this controller's working tree (`jagent.source_dir`) and `make` it on the SUT | Measuring uncommitted agent changes |
 | `preinstalled` | Assume a binary at `jagent.binary` | Manually provisioned hosts |
+
+`noop` and `source` compile on the SUT and therefore need its toolchain;
+`release` and `preinstalled` do not.
 
 The agent cannot be cross-built and copied as a binary from an arbitrary host:
 its userspace part links libbpf/libelf/libcurl, and the BPF object compiles
 against the SUT's kernel headers. `release` sidesteps this by shipping a build
 made for Ubuntu 24.04 / glibc 2.39 — so in that mode the SUT needs **no**
-toolchain. `source` mode does, and is checked for `make`, `clang`, `gcc` and
-`bpftool` up front.
+toolchain. `noop` and `source` mode do, and are checked for `make`, `clang`,
+`gcc` and `bpftool` up front. Since the campaign includes the `noop` control,
+the full campaign does need that toolchain on the SUT; `setup/sut_setup.py`
+installs it.
 
 The release archive unpacks into a version-stamped directory, so the binary is
 *discovered* rather than hardcoded and a version bump needs only
@@ -139,8 +191,10 @@ readelf -n /path/to/libjvm.so | grep -oE 'Name: [A-Za-z_]+' | sort -u
 python -m main --config configuration/spring_remote_jagent.yml --dry-run
 python -m main --config configuration/spring_remote_none.yml
 python -m main --config configuration/spring_remote_usdt.yml
+python -m main --config configuration/spring_remote_noop.yml
 python -m main --config configuration/spring_remote_jagent.yml
 python -m main --config configuration/spring_remote_otjae.yml
+python -m main --config configuration/spring_remote_both.yml
 ```
 
 Flags: `--iterations N`, `--total-rate N`, `--skip-downloads`, `--dry-run`.
@@ -161,6 +215,13 @@ Edit the variable block at the top to set `CONFIGS`, `LOAD_LEVELS`,
 count and time estimate up front, validate every configuration with `--dry-run`
 before committing hours to the campaign, and finish with a pass/fail summary.
 They exit non-zero if any run failed.
+
+The values committed here are the ones the paper's campaign ran with — all six
+variants, `LOAD_LEVELS=(50)`, `REPETITIONS=12`, `ITERATIONS_PER_RUN=1`,
+`COOLDOWN_SECONDS=120`, `ORDER_SEED=42` — so running the script unedited
+repeats it: 72 runs in about nine hours. Its output is what
+[`../EXPERIMENT_RESULTS/`](../EXPERIMENT_RESULTS/README.md) ships, one zip per
+repetition.
 
 **Ordering matters here, in two ways.**
 
@@ -232,23 +293,44 @@ process **group**, which matters because `sudo` forks before running the agent.
 ## Output
 
 Everything lands on the controller under
-`output/{timestamp}_{experiment_type}/`, named
+`output/{timestamp}_rep{NN}_{experiment_type}/` (the `rep{NN}` part is added by
+the campaign scripts), named
 `{tool}_{experiment_type}_{timestamp}_{iteration}_{total}.{ext}`:
 
 | File | From | Contents |
 |---|---|---|
-| `sut_*.log` | SUT | Service stdout/stderr. **For OTJAE this is the result log** — the `logging` exporters write the resource demands here. |
-| `jagent-trace_*.txt` | SUT | **jAgent results** — one line per transaction with wall/CPU ns and tx/rx/io/alloc bytes. |
-| `jagent_*.log` | SUT | jAgent stdout: libbpf attach diagnostics, OTLP export errors. |
+| `manifest_*.json` | controller | Resolved config, hostnames, timings, status, `campaign_repetition` / `campaign_position`. |
+| `sut_*.log` | SUT | Service stdout/stderr, incl. the JVM and agent versions actually loaded. |
 | `jmeter_*.jtl` | JMeter host | Per-request results (CSV) — the source for the latency table. |
-| `jmeter_*.log`, `*.stdout.log` | JMeter host | JMeter's log and console output incl. the summariser. |
-| `collector-telemetry_*.jsonl` | controller | **Data of record** — lossless OTLP JSON from the collector's `file` exporter: every metric and span both tools emitted. |
-| `http-logger_*.csv` | controller | Sampled Prometheus exposition (`DATA:<url> at <ts>` + body), comparable with the ASE experiment. |
-| `collector_*.log`, `collector-config_*.yaml` | controller | Collector stdout and the exact config used. |
-| `manifest_*.json` | controller | Resolved config, hostnames, timings, status. |
+| `jmeter_*.log`, `*.stdout.log` | JMeter host | JMeter's log and console output incl. the summariser. The stdout log carries the schedule-start timestamp the steady-state window is anchored on. |
+| `collector_telemetry_*.jsonl` | controller | **Data of record** — lossless OTLP JSON from the collector's `file` exporter: every metric and span both tools emitted. |
+| `collector_*.log`, `collector_config_*.yaml` | controller | Collector stdout and the exact config used. |
+| `jagent_*.log` | SUT | jAgent stdout: libbpf attach diagnostics, OTLP export errors. |
+| `jagent_trace_*.txt` | SUT | One line per transaction with wall/CPU ns and tx/rx/io/alloc bytes. **Only with `jagent.write_trace: true`**, which is off by default — the formatting and file I/O sit on the hot path and OTJAE pays no equivalent cost, so leaving it on inflates the measured overhead. The same values come out of the cumulative OTLP counters. |
+| `http_logger_*.csv` | controller | Sampled Prometheus exposition (`DATA:<url> at <ts>` + body), comparable with the ASE experiment. **Only with `http_logger.enabled: true`**, off by default. |
+
+Which files a run produces depends on what it ran: `none` and `usdt` have
+nothing exporting, so they get no collector output, and only the three
+jAgent-attached variants get a `jagent_*.log`.
 
 Per-run remote directories are deleted after download
 (`experiment.cleanup_remote: false` keeps them).
+
+## Analysing what you measured
+
+[`../EXPERIMENT_RESULTS/analyze.py`](../EXPERIMENT_RESULTS/analyze.py) reads
+these directories directly and defaults to `../EXPERIMENT_AUTOMATION/output`, so
+after a campaign:
+
+```bash
+python ../EXPERIMENT_RESULTS/analyze.py
+```
+
+It restricts everything to the steady-state window and prints the response-time
+ladder, the paired comparison against the baseline, and the per-transaction
+demand tables. See
+[`../EXPERIMENT_RESULTS/README.md`](../EXPERIMENT_RESULTS/README.md) for how its
+output maps onto the paper's tables.
 
 ## How metrics are collected
 
@@ -303,19 +385,21 @@ spans as the source for distributions.
   `sudo -n env VAR=... ebpf-jagent`. The checkout on the SUT is left untouched.
   `sudo -n env` rather than `sudo -E`, so it does not depend on the sudoers
   `env_keep` policy.
-- **`total_rate` is 50 req/s by default.** Pick a rate the uninstrumented
-  baseline sustains comfortably; the `eBPF active` configuration is ~3× slower,
-  so a rate that saturates the traced run distorts the comparison. Check the
-  JMeter summariser for errors before trusting a result.
-- **Debug output in the agent affects overhead.** `method_return` in
-  `ebpf_jagent.bpf.c` still contains `bpf_printk` calls that fire on every
-  return with `alloc > 100` or `net_tx > 0`. Writing to the trace pipe on that
-  hot path inflates the `eBPF active` numbers; remove them before quoting a
-  figure.
-- **To measure the empty-agent control** (eBPF attached but doing no work),
-  build a stripped agent whose handlers return immediately, then run a copy of
-  `spring_remote_jagent.yml` with `provision: source` and `source_dir` pointing
-  at that tree. Everything else stays identical.
+- **`total_rate` is 10 req/s in `base.yml`; the paper's campaign ran at 50.**
+  The rate comes from `LOAD_LEVELS` in `run.sh` / `run.bat`, which overrides the
+  config. Pick a rate the uninstrumented baseline sustains comfortably: the
+  traced configuration is ~5× slower, so a rate that saturates it distorts the
+  comparison. Check the JMeter summariser for errors before trusting a result.
+- **Debug output in the agent affects overhead.** Earlier builds had
+  `bpf_printk` calls in `method_return` that fired on every return with
+  `alloc > 100` or `net_tx > 0`; writing to the trace pipe on that hot path
+  inflates the `jagent` numbers. They are gone as of `v0.0.7-alpha`, the
+  release the paper measures, but check for them before quoting a figure from a
+  `provision: source` build.
+- **The empty-agent control is `spring_remote_noop.yml`.** It builds the
+  stripped agent in [`noop_agent/`](noop_agent/) — same three USDT probes, empty
+  handlers — via `jagent.provision: noop`, so nothing has to be assembled by
+  hand. Everything else is identical to the `jagent` variant.
 - **The release build is what the paper's numbers should come from.** Pinning
   `jagent.release_url` to a tag makes a rerun reproducible; `provision: source`
   measures whatever is in your checkout, which is useful for development but
